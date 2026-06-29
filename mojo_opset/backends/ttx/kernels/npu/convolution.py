@@ -753,10 +753,14 @@ def causal_conv1d_update_kernel_bdt_fwd(
             #   - 8 extract_slice calls (4 x_b slices + 4 w slices)
             #   - out_block transpose
             # x_b is [D_CHK_SIZE, buffer_len], w0-w3 are [D_CHK_SIZE].
-            out_block = (x_b[:, 0:T_CHK_SIZE] * w0[:, None] +
-                         x_b[:, 1:T_CHK_SIZE + 1] * w1[:, None] +
-                         x_b[:, 2:T_CHK_SIZE + 2] * w2[:, None] +
-                         x_b[:, 3:T_CHK_SIZE + 3] * w3[:, None])
+            x_s0 = tl.extract_slice(x_b, (0, 0), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
+            x_s1 = tl.extract_slice(x_b, (0, 1), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
+            x_s2 = tl.extract_slice(x_b, (0, 2), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
+            x_s3 = tl.extract_slice(x_b, (0, 3), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
+            out_block = (x_s0 * w0[:, None] +
+                         x_s1 * w1[:, None] +
+                         x_s2 * w2[:, None] +
+                         x_s3 * w3[:, None])
         else:
             out_block = tl.zeros((T_CHK_SIZE, D_CHK_SIZE), dtype=x_ptr.dtype.element_ty)
             x_b = tl.trans(x_b, (1, 0))
