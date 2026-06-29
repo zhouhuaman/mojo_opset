@@ -651,6 +651,7 @@ def causal_conv1d_update_kernel_bdt_fwd(
     NUM_T_CHK: tl.constexpr,
     NUM_D_CHK: tl.constexpr,
     ST_STORE_HEAD_TILE_SIZE: tl.constexpr,
+    W_IS_4: tl.constexpr,
 ):
     pid = tl.program_id(0)
     pnum = tl.num_programs(0)
@@ -663,18 +664,28 @@ def causal_conv1d_update_kernel_bdt_fwd(
         bi = bti // NUM_T_CHK
         ti = bti % NUM_T_CHK
 
-        w = tl.load(
-            tl.make_block_ptr(
-                weight_ptr,
-                shape=(dim, width),
-                strides=(width, 1),
-                offsets=(di * D_CHK_SIZE, 0),
-                block_shape=(D_CHK_SIZE, width),
-                order=(1, 0),
-            ),
-            boundary_check=(0, 1),
-            padding_option="zero",
-        )
+        if W_IS_4:
+            # Load weight as 4 independent [D_CHK_SIZE] vectors,
+            # eliminating the need for block-ptr load + transpose + extract_slice.
+            d_offs = di * D_CHK_SIZE + tl.arange(0, D_CHK_SIZE)
+            mask_w = d_offs < dim
+            w0 = tl.load(weight_ptr + d_offs * width + 0, mask=mask_w, other=0.0)
+            w1 = tl.load(weight_ptr + d_offs * width + 1, mask=mask_w, other=0.0)
+            w2 = tl.load(weight_ptr + d_offs * width + 2, mask=mask_w, other=0.0)
+            w3 = tl.load(weight_ptr + d_offs * width + 3, mask=mask_w, other=0.0)
+        else:
+            w = tl.load(
+                tl.make_block_ptr(
+                    weight_ptr,
+                    shape=(dim, width),
+                    strides=(width, 1),
+                    offsets=(di * D_CHK_SIZE, 0),
+                    block_shape=(D_CHK_SIZE, width),
+                    order=(1, 0),
+                ),
+                boundary_check=(0, 1),
+                padding_option="zero",
+            )
 
         if ti == 0:
             st_b = tl.load(
@@ -702,10 +713,6 @@ def causal_conv1d_update_kernel_bdt_fwd(
             block_off = bi * dim * seq_len + offset0[:, None] * seq_len + offset1[None, :]
             x_b = tl.load(x_ptr + block_off, mask=mask, other=0)
 
-        out_block = tl.zeros((T_CHK_SIZE, D_CHK_SIZE), dtype=x_ptr.dtype.element_ty)
-        x_b = tl.trans(x_b, (1, 0))
-        w = tl.trans(w, (1, 0))
-
         new_state_start_off = seq_len - state_len
         t_start_off = ti * T_CHK_SIZE - (width - 1)
         t_end_off = (ti + 1) * T_CHK_SIZE
@@ -715,28 +722,51 @@ def causal_conv1d_update_kernel_bdt_fwd(
                 # NOTE: In order to avoid use tl.maximum for negative offset,
                 #       we pre-compute a fix head tile size (ST_STORE_HEAD_TILE_SIZE)
                 #       to store the scene of negative address
-                x_new_h = tl.extract_slice(x_b, (-t_off, 0), (ST_STORE_HEAD_TILE_SIZE, D_CHK_SIZE), (1, 1))
-                x_new_h = tl.trans(x_new_h, (1, 0))
+                if W_IS_4:
+                    # x_b is [D_CHK_SIZE, buffer_len], extract columns directly.
+                    x_new_h = tl.extract_slice(x_b, (0, -t_off), (D_CHK_SIZE, ST_STORE_HEAD_TILE_SIZE), (1, 1))
+                else:
+                    x_new_h = tl.extract_slice(x_b, (-t_off, 0), (ST_STORE_HEAD_TILE_SIZE, D_CHK_SIZE), (1, 1))
+                    x_new_h = tl.trans(x_new_h, (1, 0))
                 nst_off_y0 = di * D_CHK_SIZE + tl.arange(0, D_CHK_SIZE)[:, None]
                 nst_off_y1_h = tl.arange(0, ST_STORE_HEAD_TILE_SIZE)[None, :]
                 nst_mask_h = (nst_off_y0 < dim) & (nst_off_y1_h >= 0) & (nst_off_y1_h < state_len)
                 block_ptr_h = bi * dim * state_len + nst_off_y0 * state_len + nst_off_y1_h
                 tl.store(conv_state_update_ptr + block_ptr_h, x_new_h, mask=nst_mask_h)
             else:
-                x_new_s = tl.extract_slice(x_b, (width - 1, 0), (T_CHK_SIZE, D_CHK_SIZE), (1, 1))
-                x_new_s = tl.trans(x_new_s, (1, 0))
+                if W_IS_4:
+                    # x_b is [D_CHK_SIZE, buffer_len], extract columns directly.
+                    x_new_s = tl.extract_slice(x_b, (0, width - 1), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
+                else:
+                    x_new_s = tl.extract_slice(x_b, (width - 1, 0), (T_CHK_SIZE, D_CHK_SIZE), (1, 1))
+                    x_new_s = tl.trans(x_new_s, (1, 0))
                 nst_off_y0 = di * D_CHK_SIZE + tl.arange(0, D_CHK_SIZE)[:, None]
                 nst_off_y1 = width - 1 + t_off + tl.arange(0, T_CHK_SIZE)[None, :]
                 nst_mask = (nst_off_y0 < dim) & (nst_off_y1 >= 0) & (nst_off_y1 < state_len)
                 block_ptr = bi * dim * state_len + nst_off_y0 * state_len + nst_off_y1
                 tl.store(conv_state_update_ptr + block_ptr, x_new_s, mask=nst_mask)
 
-        for owi in tl.range(0, width):
-            new_x = tl.extract_slice(x_b, (owi, 0), (T_CHK_SIZE, D_CHK_SIZE), (1, 1))
-            w_chl_wi = tl.extract_slice(w, (owi, 0), (1, D_CHK_SIZE), (1, 1))
-            x_mul_chl_wi = new_x * w_chl_wi
-            out_block += x_mul_chl_wi
-        out_block = tl.trans(out_block, (1, 0))
+        if W_IS_4:
+            # Single-statement 4-way FMA, eliminating:
+            #   - x_b transpose    (was [D_CHK, buf] → [buf, D_CHK])
+            #   - w transpose      (was [D_CHK, W] → [W, D_CHK])
+            #   - 8 extract_slice calls (4 x_b slices + 4 w slices)
+            #   - out_block transpose
+            # x_b is [D_CHK_SIZE, buffer_len], w0-w3 are [D_CHK_SIZE].
+            out_block = (x_b[:, 0:T_CHK_SIZE] * w0[:, None] +
+                         x_b[:, 1:T_CHK_SIZE + 1] * w1[:, None] +
+                         x_b[:, 2:T_CHK_SIZE + 2] * w2[:, None] +
+                         x_b[:, 3:T_CHK_SIZE + 3] * w3[:, None])
+        else:
+            out_block = tl.zeros((T_CHK_SIZE, D_CHK_SIZE), dtype=x_ptr.dtype.element_ty)
+            x_b = tl.trans(x_b, (1, 0))
+            w = tl.trans(w, (1, 0))
+            for owi in tl.range(0, width):
+                new_x = tl.extract_slice(x_b, (owi, 0), (T_CHK_SIZE, D_CHK_SIZE), (1, 1))
+                w_chl_wi = tl.extract_slice(w, (owi, 0), (1, D_CHK_SIZE), (1, 1))
+                x_mul_chl_wi = new_x * w_chl_wi
+                out_block += x_mul_chl_wi
+            out_block = tl.trans(out_block, (1, 0))
 
         if SILU_ACTIVATION:
             out_block = out_block * tl.sigmoid(out_block)
@@ -810,6 +840,7 @@ def causal_conv1d_update_bdt_impl(
         NUM_T_CHK=NUM_T_CHK,
         NUM_D_CHK=NUM_D_CHK,
         ST_STORE_HEAD_TILE_SIZE=int(ST_STORE_HEAD_TILE_SIZE),
+        W_IS_4=(width == 4),
     )
     conv_state.copy_(conv_state_update)
     if unsqueeze:
