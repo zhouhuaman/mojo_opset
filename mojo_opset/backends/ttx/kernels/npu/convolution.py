@@ -844,7 +844,7 @@ def causal_conv1d_update_bdt_impl(
         NUM_T_CHK=NUM_T_CHK,
         NUM_D_CHK=NUM_D_CHK,
         ST_STORE_HEAD_TILE_SIZE=int(ST_STORE_HEAD_TILE_SIZE),
-        W_IS_4=(width == 4),
+        W_IS_4=(width == 4 and dim >= 1024),
     )
     conv_state.copy_(conv_state_update)
     if unsqueeze:
