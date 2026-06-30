@@ -664,28 +664,18 @@ def causal_conv1d_update_kernel_bdt_fwd(
         bi = bti // NUM_T_CHK
         ti = bti % NUM_T_CHK
 
-        if W_IS_4:
-            # Load weight as 4 independent [D_CHK_SIZE] vectors,
-            # eliminating the need for block-ptr load + transpose + extract_slice.
-            d_offs = di * D_CHK_SIZE + tl.arange(0, D_CHK_SIZE)
-            mask_w = d_offs < dim
-            w0 = tl.load(weight_ptr + d_offs * width + 0, mask=mask_w, other=0.0)
-            w1 = tl.load(weight_ptr + d_offs * width + 1, mask=mask_w, other=0.0)
-            w2 = tl.load(weight_ptr + d_offs * width + 2, mask=mask_w, other=0.0)
-            w3 = tl.load(weight_ptr + d_offs * width + 3, mask=mask_w, other=0.0)
-        else:
-            w = tl.load(
-                tl.make_block_ptr(
-                    weight_ptr,
-                    shape=(dim, width),
-                    strides=(width, 1),
-                    offsets=(di * D_CHK_SIZE, 0),
-                    block_shape=(D_CHK_SIZE, width),
-                    order=(1, 0),
-                ),
-                boundary_check=(0, 1),
-                padding_option="zero",
-            )
+        w = tl.load(
+            tl.make_block_ptr(
+                weight_ptr,
+                shape=(dim, width),
+                strides=(width, 1),
+                offsets=(di * D_CHK_SIZE, 0),
+                block_shape=(D_CHK_SIZE, width),
+                order=(1, 0),
+            ),
+            boundary_check=(0, 1),
+            padding_option="zero",
+        )
 
         if ti == 0:
             st_b = tl.load(
@@ -747,20 +737,18 @@ def causal_conv1d_update_kernel_bdt_fwd(
                 tl.store(conv_state_update_ptr + block_ptr, x_new_s, mask=nst_mask)
 
         if W_IS_4:
-            # Single-statement 4-way FMA, eliminating:
-            #   - x_b transpose    (was [D_CHK, buf] → [buf, D_CHK])
-            #   - w transpose      (was [D_CHK, W] → [W, D_CHK])
-            #   - 8 extract_slice calls (4 x_b slices + 4 w slices)
-            #   - out_block transpose
-            # x_b is [D_CHK_SIZE, buffer_len], w0-w3 are [D_CHK_SIZE].
+            # Plan B: keep block_ptr for weight load (hardware accelerated),
+            # eliminate all transposes by extracting columns directly.
+            # w is [D_CHK_SIZE, W], x_b is [D_CHK_SIZE, buffer_len].
+            w0 = tl.extract_slice(w, (0, 0), (D_CHK_SIZE, 1), (1, 1))
+            w1 = tl.extract_slice(w, (0, 1), (D_CHK_SIZE, 1), (1, 1))
+            w2 = tl.extract_slice(w, (0, 2), (D_CHK_SIZE, 1), (1, 1))
+            w3 = tl.extract_slice(w, (0, 3), (D_CHK_SIZE, 1), (1, 1))
             x_s0 = tl.extract_slice(x_b, (0, 0), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
             x_s1 = tl.extract_slice(x_b, (0, 1), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
             x_s2 = tl.extract_slice(x_b, (0, 2), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
             x_s3 = tl.extract_slice(x_b, (0, 3), (D_CHK_SIZE, T_CHK_SIZE), (1, 1))
-            out_block = (x_s0 * w0[:, None] +
-                         x_s1 * w1[:, None] +
-                         x_s2 * w2[:, None] +
-                         x_s3 * w3[:, None])
+            out_block = (x_s0 * w0 + x_s1 * w1 + x_s2 * w2 + x_s3 * w3)
         else:
             out_block = tl.zeros((T_CHK_SIZE, D_CHK_SIZE), dtype=x_ptr.dtype.element_ty)
             x_b = tl.trans(x_b, (1, 0))
@@ -844,7 +832,7 @@ def causal_conv1d_update_bdt_impl(
         NUM_T_CHK=NUM_T_CHK,
         NUM_D_CHK=NUM_D_CHK,
         ST_STORE_HEAD_TILE_SIZE=int(ST_STORE_HEAD_TILE_SIZE),
-        W_IS_4=(width == 4 and dim >= 1024),
+        W_IS_4=(width == 4),
     )
     conv_state.copy_(conv_state_update)
     if unsqueeze:
